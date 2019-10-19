@@ -13,14 +13,18 @@
 /*
     Virtual Memory map:
     (0MB-4MB - identity mapped)
+	2MB - 3MB: page directories for tasks
     3MB - 4MB: kmalloc_eternal
 	4MB-PAGE_SIZE...4MB - TempMap page (for a way to access a physical address)
 
     0xc0000000 - 0xffffffff : kernel address space
     0xc0000000 - 0xc0ffffff : kernel image (code + data)
     0xc1000000 - 0xc5000000 : kernel heap
-	0xd0000000 - 0xd0001000 - kernel stack
+	0xd0000000 - 0xe0000000 - kernel stacks (a kernel stack per task)
+	// 0xe0000000 - 0xe0001000 - page directories for tasks
 */
+
+constexpr u32 IDENTITY_MAP_END = 4*MB;
 
 
 
@@ -39,11 +43,12 @@ private:
 
 public:
     static void initialize(multiboot_info_t* mbt);
-	static MemoryManager& the();
+	static MemoryManager& the(u32 cr3 = 0);
 
 	VirtualAddress temp_map(PhysicalAddress addr);
 	void un_temp_map();
 	void allocate(VirtualAddress virt_addr, bool writable, bool user_allowed);
+	void deallocate(VirtualAddress virt_addr, bool free_page=true);
 	void flush_tlb(VirtualAddress addr);
 	void flush_entire_tlb();
 	/**
@@ -55,7 +60,10 @@ public:
 	 * Note: if tempMap_PageTable=true, you should make sure to call un_temp_map after you're done
 	 *       manipulating the PTE
 	 */
-    PTE ensure_pte(VirtualAddress addr, bool create_new_PageTable=true, bool tempMap_pageTable=true);
+    PTE ensure_pte(VirtualAddress addr,
+			 bool create_new_PageTable=true,
+			 bool tempMap_pageTable=true
+			 );
 	PDE get_pde(VirtualAddress virt_addr);
 	PTE get_pte(VirtualAddress virt_addr, const PDE& pde);
 

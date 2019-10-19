@@ -13,6 +13,10 @@
 
 static MemoryManager* mm = nullptr;
 
+// TODO: use a bitmap for page directories instead of just advancing next_page_directory_allocation
+static u32 next_page_directory_allocation = 2 * MB;
+const u32 PAGE_DIRECTORY_ALLOCATION_END = next_page_directory_allocation + 1*MB;
+
 void MemoryManager::initialize(multiboot_info_t* mbt) { kprintf("MemoryManager::initialize()\n");
     mm = new MemoryManager();
     mm->init(mbt);
@@ -98,6 +102,7 @@ bool MemoryManager::is_frame_available(const Frame frame) {
 
 }
 
+
 VirtualAddress MemoryManager::temp_map(PhysicalAddress addr) {
     kprintf("temp_map: 0x%x\n", (u32)addr);
     ASSERT(!m_tempmap_used, "TempMap is already used");
@@ -124,10 +129,6 @@ void MemoryManager::un_temp_map() {
 
 void MemoryManager::flush_tlb(VirtualAddress addr) {
     asm volatile("invlpg (%0)" ::"r" ((u32)addr) : "memory");
-    // asm volatile("invlpg %0"
-    //             :
-    //             : "m"(addr)
-    //             : "memory");
 }
 void MemoryManager::flush_entire_tlb()
 {
@@ -137,35 +138,18 @@ void MemoryManager::flush_entire_tlb()
             : "%eax", "memory");
 }
 
-void dbg_assert_page_all_0(VirtualAddress addr) {
-    kprintf("dbg_assert_all_0 for: 0x%x\n", (u32)addr);
-    u32* p = (u32*)(u32)addr;
-    kprintf("p: 0x%x\n", (u32)p);
-    for(size_t i = 0; i < NUM_PAGE_Table_ENTRIES; i++) {
-        // kprintf("%d, %d\n", i, p[i]);
-        ASSERT(p[i]==0, "failed");
-    }
-}
-
 PTE MemoryManager::ensure_pte(VirtualAddress addr, bool create_new_PageTable, bool tempMap_pageTable) {
     kprintf("MemoryManager::ensure_pte: 0x%x\n", (u32)addr);
     auto pde = m_page_directory->get_pde(addr);
-    bool zeroed_PT = false;
+    bool new_pagetable = false;
     if(!pde.is_present() && create_new_PageTable) {
         kprintf("no PDE for virt addr: 0x%x, creating a new page table\n", addr);
         // we need to create a new page table
         Err err;
         Frame pt_frame = get_free_frame(err);
         ASSERT(!err, "could not allocate page table");
-        // zero page table
-        auto temp_vaddr = temp_map(pt_frame);
-        memset((void*)(u32)temp_vaddr, 0, PAGE_SIZE);
-        kprintf("dbg1\n");
-        dbg_assert_page_all_0(temp_vaddr);
-        un_temp_map();
-        zeroed_PT = true;
+        new_pagetable = true;
 
-        // TODO: we probably also need to tempmap the page directory or have it constantly mapped
         pde.set_addr(pt_frame);
         pde.set_present(true);
         pde.set_writable(true);
@@ -176,13 +160,14 @@ PTE MemoryManager::ensure_pte(VirtualAddress addr, bool create_new_PageTable, bo
 
     VirtualAddress pt_addr = pde.addr();
     if(tempMap_pageTable) {
-        pt_addr = temp_map(pde.addr()); // map page table so we can access it
+        pt_addr = temp_map(pt_addr); // map page table so we can access it
     }
 
-    if(zeroed_PT) {
-        kprintf("dbg2\n");
-        dbg_assert_page_all_0(pt_addr);
+    if(new_pagetable) {
+        // zero the new page table
+        memset((void*)(u32)pt_addr, 0, PAGE_SIZE);
     }
+
     auto page_table = PageTable(pt_addr);
 
     auto pte = page_table.get_pte(addr);
@@ -193,8 +178,7 @@ PTE MemoryManager::ensure_pte(VirtualAddress addr, bool create_new_PageTable, bo
 void MemoryManager::allocate(VirtualAddress virt_addr, bool writable, bool user_allowed) {
     kprintf("MM: allocate: 0x%x\n", virt_addr);
     auto pte = ensure_pte(virt_addr);
-    kprintf("MemoryManager::allocate: before asserion for: 0x%x\n", (u32)virt_addr);
-    ASSERT(!pte.is_present(), "allocate: PTE already present for this virtual addr");
+    ASSERT(!pte.is_present(), "allocate: PTE already present for virtual addr");
     Err err;
     Frame pt_frame = get_free_frame(err);
     ASSERT(!err, "could not allocate frame");
@@ -202,7 +186,21 @@ void MemoryManager::allocate(VirtualAddress virt_addr, bool writable, bool user_
     pte.set_present(true);
     pte.set_writable(writable);
     pte.set_user_allowed(user_allowed);
-    un_temp_map(); // page table of PTE is temp mapped
+    un_temp_map(); // 'ensure_pte' temp_mapped the page table of PTE
+    flush_tlb(virt_addr);
+}
+
+void MemoryManager::deallocate(VirtualAddress virt_addr, bool free_page) {
+    kprintf("MM: deallocate: 0x%x\n", virt_addr);
+    auto pte = ensure_pte(virt_addr);
+    ASSERT(pte.is_present(), "allocate: PTE not present for virtual addr");
+    if(free_page) {
+        set_frame_available(pte.addr());
+    }
+    pte.zero();
+    // TODO: check if entire page table is empty.
+    // if it is, free the page table's frame and zero its PDE
+    un_temp_map(); // 'ensure_pte' temp_mapped the page table of PTE
     flush_tlb(virt_addr);
 
 }
@@ -238,15 +236,15 @@ PageDirectory MemoryManager::clone_page_directory() {
     #endif
 
     Err err;
-    auto new_PD_addr = get_free_frame(err);
-    ASSERT(!err, "couldn't get frame for new page directorty");
+    auto new_PD_addr = next_page_directory_allocation;
+    next_page_directory_allocation += PAGE_SIZE;
     auto new_page_directory = PageDirectory(PhysicalAddress(new_PD_addr));
 
     // shallow copy of page directory
     memcpy_frames(new_page_directory.get_base(), m_page_directory->get_base());
 
-    auto PD_entries_virtaddr = temp_map((u32)m_page_directory->entries());
-    u32* PD_entries = (u32*)(u32)PD_entries_virtaddr;
+    u32* PD_entries = new u32[NUM_PAGE_DIRECTORY_ENTRIES];
+    copy_from_physical_frame((u32)m_page_directory->entries(), (u8*)PD_entries);
 
     u32* new_page_tables_addresses = new u32[NUM_PAGE_DIRECTORY_ENTRIES]; // allocate on heap because kernel stack is small
     memset(new_page_tables_addresses, 0, NUM_PAGE_DIRECTORY_ENTRIES*sizeof(u32));
@@ -256,6 +254,13 @@ PageDirectory MemoryManager::clone_page_directory() {
     // seconds pass: update PDEs in new page directory to point to the new (copied) page tables
 
     for(size_t pde_idx = 0; pde_idx < NUM_PAGE_DIRECTORY_ENTRIES; ++pde_idx) {
+        // If this PDE entry is identity mapped,
+        // skip it - new page directory will point to the same page table
+        // it's OK since the identity map page tables
+        // are not expected to change
+        if(pde_idx <= IDENTITY_MAP_END/(4*MB)) {
+            continue;
+        }
         auto pde = PDE(PD_entries[pde_idx]);
         if(!pde.is_present())
             continue;
@@ -273,6 +278,7 @@ PageDirectory MemoryManager::clone_page_directory() {
         // shallow copy of page table
         memcpy_frames(new_page_table.get_base(), page_table.get_base());
     }
+    delete[] PD_entries;
     // point new PDEs to new page tables
     auto new_PD_vaddr = temp_map(new_page_directory.get_base());
     for(size_t pde_idx = 0; pde_idx < NUM_PAGE_DIRECTORY_ENTRIES; ++pde_idx) {
@@ -287,10 +293,13 @@ PageDirectory MemoryManager::clone_page_directory() {
 }
 
 
-MemoryManager& MemoryManager::the() {
+MemoryManager& MemoryManager::the(u32 cr3) {
     ASSERT(mm != nullptr, "MemoryManager is uninitialized");
     // update page table address to CR3 value
-    mm->m_page_directory->set_page_directoy_addr(PhysicalAddress(get_cr3()));
+    if(cr3 == 0) {
+        cr3 = get_cr3();
+    }
+    mm->m_page_directory->set_page_directoy_addr(PhysicalAddress(cr3));
     return *mm;
 }
 
