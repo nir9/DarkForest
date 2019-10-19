@@ -30,7 +30,7 @@ void* memcpy(void* dest, const void* src, size_t n) {
 	char* ps = (char*) src;
 	char* pd = (char*) dest;
 	for(; n > 0; n--) {
-		*(ps++) = *(pd++);
+		*(pd++) = *(ps++);
 	}
 	return dest;
 }
