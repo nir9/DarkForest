@@ -19,6 +19,7 @@
     0xc0000000 - 0xffffffff : kernel address space
     0xc0000000 - 0xc0ffffff : kernel image (code + data)
     0xc1000000 - 0xc5000000 : kernel heap
+	0xd0000000 - 0xd0001000 - kernel stack
 */
 
 
@@ -64,10 +65,20 @@ public:
 	void set_frame_available(Frame frame);
 	bool is_frame_available(const Frame frame);
 
+	/**
+	 * Return address of a new, cloned page directory
+	 * The page directory is cloned from the current page directory
+	 * Page tables are also clones, but the physical frames they point to are NOT cloned
+	 */
+	PageDirectory clone_page_directory();
+
+	void copy_from_physical_frame(PhysicalAddress src, u8* dst);
+	void copy_to_physical_frame(PhysicalAddress dst, u8* src);
+	void memcpy_frames(PhysicalAddress dst, PhysicalAddress src);
+
 private:
-	u32 m_frames_avail_bitmap[N_FRAME_BITMAP_ENTRIES]; // is the frame available for the OS? can it be accessed?
-	// u32 m_frames_free_bitmap[N_FRAME_BITMAP_ENTRIES]; // is the frame currently free?
-	PageDirectory* m_page_directory; // TODO: make this a shared_ptr
+	u32 m_frames_avail_bitmap[N_FRAME_BITMAP_ENTRIES];
+	PageDirectory* m_page_directory;
 	bool m_tempmap_used;
 
 };

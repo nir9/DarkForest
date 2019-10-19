@@ -8,6 +8,7 @@
 #include "PageDirectory.h"
 #include "cpu.h"
 #include "kmalloc.h"
+// #include "string.h"
 
 
 static MemoryManager* mm = nullptr;
@@ -98,6 +99,7 @@ bool MemoryManager::is_frame_available(const Frame frame) {
 }
 
 VirtualAddress MemoryManager::temp_map(PhysicalAddress addr) {
+    kprintf("temp_map: 0x%x\n", (u32)addr);
     ASSERT(!m_tempmap_used, "TempMap is already used");
     auto pte = ensure_pte(TEMPMAP_ADDR, false, false);
     pte.set_addr(addr);
@@ -135,8 +137,20 @@ void MemoryManager::flush_entire_tlb()
             : "%eax", "memory");
 }
 
+void dbg_assert_page_all_0(VirtualAddress addr) {
+    kprintf("dbg_assert_all_0 for: 0x%x\n", (u32)addr);
+    u32* p = (u32*)(u32)addr;
+    kprintf("p: 0x%x\n", (u32)p);
+    for(size_t i = 0; i < NUM_PAGE_Table_ENTRIES; i++) {
+        // kprintf("%d, %d\n", i, p[i]);
+        ASSERT(p[i]==0, "failed");
+    }
+}
+
 PTE MemoryManager::ensure_pte(VirtualAddress addr, bool create_new_PageTable, bool tempMap_pageTable) {
+    kprintf("MemoryManager::ensure_pte: 0x%x\n", (u32)addr);
     auto pde = m_page_directory->get_pde(addr);
+    bool zeroed_PT = false;
     if(!pde.is_present() && create_new_PageTable) {
         kprintf("no PDE for virt addr: 0x%x, creating a new page table\n", addr);
         // we need to create a new page table
@@ -146,8 +160,12 @@ PTE MemoryManager::ensure_pte(VirtualAddress addr, bool create_new_PageTable, bo
         // zero page table
         auto temp_vaddr = temp_map(pt_frame);
         memset((void*)(u32)temp_vaddr, 0, PAGE_SIZE);
+        kprintf("dbg1\n");
+        dbg_assert_page_all_0(temp_vaddr);
         un_temp_map();
+        zeroed_PT = true;
 
+        // TODO: we probably also need to tempmap the page directory or have it constantly mapped
         pde.set_addr(pt_frame);
         pde.set_present(true);
         pde.set_writable(true);
@@ -161,15 +179,21 @@ PTE MemoryManager::ensure_pte(VirtualAddress addr, bool create_new_PageTable, bo
         pt_addr = temp_map(pde.addr()); // map page table so we can access it
     }
 
+    if(zeroed_PT) {
+        kprintf("dbg2\n");
+        dbg_assert_page_all_0(pt_addr);
+    }
     auto page_table = PageTable(pt_addr);
 
-    return page_table.get_pte(addr);
+    auto pte = page_table.get_pte(addr);
+    return pte;
 
 }
 
 void MemoryManager::allocate(VirtualAddress virt_addr, bool writable, bool user_allowed) {
     kprintf("MM: allocate: 0x%x\n", virt_addr);
     auto pte = ensure_pte(virt_addr);
+    kprintf("MemoryManager::allocate: before asserion for: 0x%x\n", (u32)virt_addr);
     ASSERT(!pte.is_present(), "allocate: PTE already present for this virtual addr");
     Err err;
     Frame pt_frame = get_free_frame(err);
@@ -183,9 +207,90 @@ void MemoryManager::allocate(VirtualAddress virt_addr, bool writable, bool user_
 
 }
 
+void MemoryManager::copy_from_physical_frame(PhysicalAddress src, u8* dst) {
+    auto src_vaddr = temp_map(src);
+    memcpy(dst, (u8*)(u32)src_vaddr, PAGE_SIZE);
+    un_temp_map();
+}
+
+void MemoryManager::copy_to_physical_frame(PhysicalAddress dst, u8* src) {
+    auto dst_vaddr = temp_map(dst);
+    memcpy((u8*)(u32)dst_vaddr, src, PAGE_SIZE);
+    un_temp_map();
+}
+
+void MemoryManager::memcpy_frames(PhysicalAddress dst, PhysicalAddress src) {
+    // temp buffer on the heap to copy to/from frames
+    // we need to use it since we only temp_map a single frame at a time
+    // so we can't copy directly between two frames
+    u8* temp_buff = new u8[PAGE_SIZE]; // allocate on heap because kernel stack is small
+    copy_from_physical_frame(src, temp_buff);
+    copy_to_physical_frame(dst, temp_buff);
+    delete[] temp_buff;
+
+}
+
+#define DBG_CLONE_PAGE_DIRECTORY
+
+PageDirectory MemoryManager::clone_page_directory() {
+    #ifdef DBG_CLONE_PAGE_DIRECTORY
+    kprintf("MemoryManager::clone_page_directory from: 0x%x\n", (u32)m_page_directory->get_base());
+    #endif
+
+    Err err;
+    auto new_PD_addr = get_free_frame(err);
+    ASSERT(!err, "couldn't get frame for new page directorty");
+    auto new_page_directory = PageDirectory(PhysicalAddress(new_PD_addr));
+
+    // shallow copy of page directory
+    memcpy_frames(new_page_directory.get_base(), m_page_directory->get_base());
+
+    auto PD_entries_virtaddr = temp_map((u32)m_page_directory->entries());
+    u32* PD_entries = (u32*)(u32)PD_entries_virtaddr;
+
+    u32* new_page_tables_addresses = new u32[NUM_PAGE_DIRECTORY_ENTRIES]; // allocate on heap because kernel stack is small
+    memset(new_page_tables_addresses, 0, NUM_PAGE_DIRECTORY_ENTRIES*sizeof(u32));
+
+    // two passess over original page directory
+    // first pass: alocate & copy new page tables for each present PDE
+    // seconds pass: update PDEs in new page directory to point to the new (copied) page tables
+
+    for(size_t pde_idx = 0; pde_idx < NUM_PAGE_DIRECTORY_ENTRIES; ++pde_idx) {
+        auto pde = PDE(PD_entries[pde_idx]);
+        if(!pde.is_present())
+            continue;
+        auto page_table_addr = pde.addr();
+        #ifdef DBG_CLONE_PAGE_DIRECTORY
+        kprintf("MemoryManager::clone page table: 0x%x\n", (u32)page_table_addr);
+        #endif
+
+        auto page_table = PageTable(page_table_addr);
+
+        auto new_PT_addr = get_free_frame(err);
+        ASSERT(!err, "couldn't get frame for new page table");
+        new_page_tables_addresses[pde_idx] = new_PT_addr;
+        auto new_page_table = PageTable(new_PT_addr);
+        // shallow copy of page table
+        memcpy_frames(new_page_table.get_base(), page_table.get_base());
+    }
+    // point new PDEs to new page tables
+    auto new_PD_vaddr = temp_map(new_page_directory.get_base());
+    for(size_t pde_idx = 0; pde_idx < NUM_PAGE_DIRECTORY_ENTRIES; ++pde_idx) {
+        if(new_page_tables_addresses[pde_idx] == 0)
+            continue;
+        auto new_pde = PDE(((u32*)new_PD_vaddr)[pde_idx]);
+        new_pde.set_addr(new_page_tables_addresses[pde_idx]);
+    }
+    un_temp_map();
+    delete[] new_page_tables_addresses;
+    return new_page_directory;
+}
+
 
 MemoryManager& MemoryManager::the() {
     ASSERT(mm != nullptr, "MemoryManager is uninitialized");
+    // update page table address to CR3 value
+    mm->m_page_directory->set_page_directoy_addr(PhysicalAddress(get_cr3()));
     return *mm;
 }
 

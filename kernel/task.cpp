@@ -32,11 +32,11 @@ void stack_push(u32** esp, u32 val) {
 ThreadControlBlock* create_kernel_task(void (*func)()) {
     ThreadControlBlock* tcb = new ThreadControlBlock();
     tcb->id = ++current_thread_id;
-    tcb->CR3 = (void*) get_cr3();
+    tcb->CR3 = (void*) (u32)MemoryManager::the().clone_page_directory().get_base();
     // allocate stack space
     MemoryManager::the().allocate((u32)next_task_stack_virtual_addr, true, false);
     u32* new_stack = (u32*)((u32)next_task_stack_virtual_addr + PAGE_SIZE - 4);
-    // increment stack space for next task to be created bya page
+    // increment stack space for next task to be created by a page
     next_task_stack_virtual_addr = (void*)((u32)next_task_stack_virtual_addr + PAGE_SIZE);
     // initialize value of stack (will be popped off at the end of switch_to_task)
     stack_push(&new_stack, (u32)func); // will be popped of as EIP
